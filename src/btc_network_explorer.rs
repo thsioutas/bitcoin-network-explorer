@@ -59,13 +59,16 @@ impl BtcNetworkExplorer {
         {
             while let Some(peer) = queued_peers.lock().await.pop() {
                 let discovered_peers_clone = self.discovered_peers.clone();
-                let connection_timeout_clone = self.connection_timeout.clone();
-                let target_discovered_peers_clone = self.target_discovered_peers.clone();
+                let connection_timeout_clone = self.connection_timeout;
+                let target_discovered_peers_clone = self.target_discovered_peers;
                 let queued_peers_clone = queued_peers.clone();
                 let semaphore = semaphore.clone();
+
                 tasks.push(tokio::spawn(async move {
-                    if let Err(err) = semaphore.acquire().await {
-                        error!("Failed to acquire semaphore = {:?}", err);
+                    let _permit = semaphore.acquire().await;
+                    // Check again if we need to process the peer. The target could have been reached while waiting for semaphore's permit.
+                    if discovered_peers_clone.lock().await.len() >= target_discovered_peers_clone {
+                        return;
                     }
                     let mut attempts = 0;
                     // Process the same peer MAX_PROCESS_PEER_ATTEMPTS times
@@ -81,7 +84,12 @@ impl BtcNetworkExplorer {
                         {
                             error!("Failed to crawl peer {}: {}", peer, e);
                         }
-                        info!("Processed peer {}. Still need to discover {} peers. {} peers in queue to be checked.", peer, target_discovered_peers_clone - discovered_peers_clone.lock().await.len(), queued_peers_clone.lock().await.len());
+                        let to_be_checked = if target_discovered_peers_clone >= discovered_peers_clone.lock().await.len() {
+                            target_discovered_peers_clone - discovered_peers_clone.lock().await.len()
+                        } else {
+                            0
+                        };
+                        info!("Processed peer {}. Still need to discover {} peers. {} peers in queue to be checked.", peer, to_be_checked, queued_peers_clone.lock().await.len());
                         attempts += 1;
                     }
                 }));
@@ -116,11 +124,10 @@ async fn process_peer(
 
     // Add new peers to the list of the unique discovered peers
     // Also, add these peers to the queued_peers list
-    let mut discovered_peers = discovered_peers.lock().await;
     for peer in new_peers {
-        if discovered_peers.len() >= target_discovered_peers {
+        if discovered_peers.lock().await.len() >= target_discovered_peers {
             break;
-        } else if discovered_peers.insert(peer) {
+        } else if discovered_peers.lock().await.insert(peer) {
             queued_peers.lock().await.push(peer);
         }
     }
@@ -242,7 +249,7 @@ async fn perform_handshake(
         .await?
 }
 
-pub fn build_version_message(receiver_address: &SocketAddr) -> VersionMessage {
+fn build_version_message(receiver_address: &SocketAddr) -> VersionMessage {
     // The height of the block that the node is currently at.
     // We are always at the genesis block. because our implementation is not a real node.
     const START_HEIGHT: i32 = 0;
