@@ -1,11 +1,10 @@
-mod tracing_helper;
 mod btc_explorer;
 mod codec;
+mod tracing_helper;
 
 use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
-
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

@@ -1,20 +1,20 @@
-use std::net::{SocketAddr, Ipv4Addr, SocketAddrV4};
-use std::collections::HashSet;
-use std::time::Duration;
+use crate::codec::BitcoinCodec;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_network::VersionMessage;
-use bitcoin::Network;
-use rand::Rng;
-use crate::codec::BitcoinCodec;
-use futures::{StreamExt, SinkExt, TryFutureExt};
 use bitcoin::p2p::{Address, ServiceFlags};
+use bitcoin::Network;
+use futures::{SinkExt, StreamExt, TryFutureExt};
+use rand::Rng;
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, error::Elapsed};
-use tracing::{error, warn};
+use tokio::time::{error::Elapsed, timeout};
 use tokio_util::codec::Framed;
-use tokio::net::TcpStream;
+use tracing::{debug, error, info, warn};
 
 pub async fn crawl_network(
     initial_address: SocketAddr,
@@ -22,11 +22,13 @@ pub async fn crawl_network(
     target_discovered_peers: usize,
     max_concurrent_tasks: usize,
 ) -> HashSet<SocketAddr> {
+    // Each peer should be processed more than once because the first time might not return all the available info for several reasons (timeouts etc)
     const MAX_PROCESS_PEER_ATTEMPTS: u8 = 2;
+
     let discovered_peers = Arc::new(Mutex::new(HashSet::new()));
     // This could also be a HashSet but due to the logic we have to add a peer to the discovered_peers
     // it can safely be a Vec
-    let mut queued_peers = Arc::new(Mutex::new(vec![initial_address]));
+    let queued_peers = Arc::new(Mutex::new(vec![initial_address]));
     let semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
 
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
@@ -37,7 +39,7 @@ pub async fn crawl_network(
         && (!queued_peers.lock().await.is_empty()
             || tasks.iter().any(|handle| !handle.is_finished()))
     {
-        while let Some(peer_address) = queued_peers.lock().await.pop() {
+        while let Some(peer) = queued_peers.lock().await.pop() {
             let discovered_peers = discovered_peers.clone();
             let queued_peers = queued_peers.clone();
             let semaphore = semaphore.clone();
@@ -46,9 +48,10 @@ pub async fn crawl_network(
                     error!("Failed to acquire semaphore = {:?}", err);
                 }
                 let mut attempts = 0;
+                // Process the same peer MAX_PROCESS_PEER_ATTEMPTS times
                 while attempts < MAX_PROCESS_PEER_ATTEMPTS {
                     if let Err(e) = process_peer(
-                        peer_address,
+                        peer,
                         connection_timeout,
                         target_discovered_peers,
                         discovered_peers.clone(),
@@ -56,8 +59,9 @@ pub async fn crawl_network(
                     )
                     .await
                     {
-                        error!("Failed to crawl peer {}: {}", peer_address, e);
+                        error!("Failed to crawl peer {}: {}", peer, e);
                     }
+                    info!("Processed peer {}. Still need to discover {} peers. {} peers in queue to be checked.", peer, target_discovered_peers - discovered_peers.lock().await.len(), queued_peers.lock().await.len());
                     attempts += 1;
                 }
             }))
@@ -71,23 +75,22 @@ pub async fn crawl_network(
     discovered_peers
 }
 
-
 /// Process a single peer by:
 /// 1. performing the necessary handshake, and
 /// 2. collect new peer addresses
 async fn process_peer(
-    peer_address: SocketAddr,
+    peer: SocketAddr,
     connection_timeout: u64,
     target_discovered_peers: usize,
     discovered_peers: Arc<Mutex<HashSet<SocketAddr>>>,
     queued_peers: Arc<Mutex<Vec<SocketAddr>>>,
 ) -> Result<(), Error> {
     // Connect and perform handshake
-    let mut stream = connect(&peer_address, connection_timeout).await?;
-    perform_handshake(&mut stream, peer_address).await?;
+    let mut stream = connect(&peer, connection_timeout).await?;
+    perform_handshake(&mut stream, peer).await?;
 
     // Collect new peers from the given peer_address
-    let new_peers = collect_peers(peer_address, &mut stream).await?;
+    let new_peers = collect_peers(&mut stream).await?;
 
     // Add new peers to the list of the unique discovered peers
     // Also, add these peers to the queued_peers list
@@ -103,22 +106,18 @@ async fn process_peer(
     Ok(())
 }
 
-
-/// Collect peers from the given peer using the Bitcoin P2P protocol.
+/// Collect peers from the given stream using the Bitcoin P2P protocol.
 ///
-/// Listens for `addr` messages and parses peer information.
+/// Listens for `Addr` messages and parses peer information.
 ///
 /// # Parameters
-/// - `peer_address`: The address of the peer.
 /// - `stream`: The TCP stream connected to the peer.
 /// # Returns
-/// A list of new peers discovered from the `addr` message.
+/// A list of new peers discovered from the `Addr` message.
 async fn collect_peers(
-    peer_address: SocketAddr,
     stream: &mut Framed<TcpStream, BitcoinCodec>,
 ) -> Result<Vec<SocketAddr>, Error> {
-    let collect_peers_timeout = Duration::from_secs(2);
-    let result = timeout(collect_peers_timeout, async {
+    let collect_peers_task = async {
         let mut new_peers = Vec::new();
         while let Some(result) = stream.next().await {
             match result {
@@ -142,27 +141,23 @@ async fn collect_peers(
                             .await
                             .map_err(Error::SendingFailed)?;
                     }
-                    _ => {
-                        // Ignore other messages for now
-                        // TODO (part 3): In addition to the above timeout we could also add some smart logic here
-                        // We could exit even faster here.
-                        warn!("Ignoring unsupported message type");
+                    NetworkMessage::Alert(_) | NetworkMessage::Ping(_) => {
+                        debug!("Ignoring whitelisted messages");
                     }
+                    _ => warn!("Ignoring unsupported message type"),
                 },
                 Err(e) => {
-                    warn!("Error processing message from {}: {}", peer_address, e);
+                    warn!("Error processing message: {}", e);
                     return Err(Error::ConnectionLost);
                 }
             }
         }
         Ok(new_peers)
-    })
-    .await;
-    match result {
-        Ok(Ok(peers)) => Ok(peers),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(Error::CollectPeersTimeout),
-    }
+    };
+    let collect_peers_timeout = Duration::from_secs(2);
+    timeout(collect_peers_timeout, collect_peers_task)
+        .map_err(|_| Error::CollectPeersTimeout)
+        .await?
 }
 
 async fn connect(
@@ -180,25 +175,23 @@ async fn connect(
 /// Perform a Bitcoin handshake as per [this protocol documentation](https://en.bitcoin.it/wiki/Protocol_documentation)
 async fn perform_handshake(
     stream: &mut Framed<TcpStream, BitcoinCodec>,
-    peer_address: SocketAddr,
+    peer: SocketAddr,
 ) -> Result<(), Error> {
     let version_message = RawNetworkMessage::new(
         Network::Bitcoin.magic(),
-        NetworkMessage::Version(build_version_message(&peer_address)),
+        NetworkMessage::Version(build_version_message(&peer)),
     );
 
     stream
         .send(version_message)
         .await
         .map_err(Error::SendingFailed)?;
-
-    let handshake_timeout = Duration::from_secs(1);
-    let result = timeout(handshake_timeout, async {
+    let handshake_task = async {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(message) => match message.payload() {
                     NetworkMessage::Version(remote_version) => {
-                        tracing::info!("Version message: {:?}", remote_version);
+                        debug!("Version message: {:?}", remote_version);
                         stream
                             .send(RawNetworkMessage::new(
                                 Network::Bitcoin.magic(),
@@ -210,38 +203,32 @@ async fn perform_handshake(
                         return Ok(());
                     }
                     other_message => {
-                        // We're only interested in the version message right now. Keep the loop running.
-                        // TODO (part 3): In addition to the above timeout we could also add some smart logic here
-                        // We could exit even faster here.
-                        tracing::debug!("Unsupported message: {:?}", other_message);
+                        // We're only interested in the version message. Keep the loop running.
+                        debug!("Unsupported message: {:?}", other_message);
                     }
                 },
                 Err(err) => {
-                    tracing::error!("Decoding error: {}", err);
+                    error!("Decoding error: {}", err);
                 }
             }
         }
         Err(Error::ConnectionLost)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(Error::HandshakeTimeout),
-    }
+    };
+    let handshake_timeout = Duration::from_secs(1);
+    timeout(handshake_timeout, handshake_task)
+        .map_err(|_| Error::HandshakeTimeout)
+        .await?
 }
 
-
 pub fn build_version_message(receiver_address: &SocketAddr) -> VersionMessage {
-    /// The height of the block that the node is currently at.
-    /// We are always at the genesis block. because our implementation is not a real node.
+    // The height of the block that the node is currently at.
+    // We are always at the genesis block. because our implementation is not a real node.
     const START_HEIGHT: i32 = 0;
-    /// The most popular user agent. See https://bitnodes.io/nodes/
+    // The most popular user agent. See https://bitnodes.io/nodes/
     const USER_AGENT: &str = "/Satoshi:25.0.0/";
     const SERVICES: ServiceFlags = ServiceFlags::NONE;
-    /// The address of this local node.
-    /// This address doesn't matter much as it will be ignored by the bitcoind node in most cases.
+    // The address of this local node.
+    // This address doesn't matter much as it will be ignored by the bitcoind node in most cases.
     let sender_address: SocketAddr =
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
 
