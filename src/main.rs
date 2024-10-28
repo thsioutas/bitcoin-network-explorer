@@ -1,7 +1,8 @@
-mod btc_explorer;
+mod btc_network_explorer;
 mod codec;
 mod tracing_helper;
 
+use btc_network_explorer::BtcNetworkExplorer;
 use clap::Parser;
 use std::net::SocketAddr;
 use tracing::info;
@@ -9,10 +10,10 @@ use tracing::info;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// The address of the node to reach to.
+    /// The address of the inital node to reach to.
     /// `dig seed.bitcoin.sipa.be +short` may provide a fresh list of nodes.
     #[arg(short, long, default_value = "47.243.121.223:8333")]
-    remote_address: String,
+    initial_peer: String,
 
     /// The connection timeout, in milliseconds.
     /// Most nodes will quickly respond. If they don't, we'll probably want to talk to other nodes instead.
@@ -33,23 +34,26 @@ async fn main() {
     tracing_helper::init_tracing();
     let args = Args::parse();
 
-    // Parse the provided remote address
-    // To be used as the initial peer address
-    let remote_address = args
-        .remote_address
+    // Parse the provided initial address
+    let initial_peer = args
+        .initial_peer
         .parse::<SocketAddr>()
         .expect("Invalid remote address");
 
     // Start network crawling
     info!("Start network crawling");
-    let start = std::time::Instant::now();
-    let addresses = btc_explorer::crawl_network(
-        remote_address,
+    let btc_network_explorer = BtcNetworkExplorer::new(
+        initial_peer,
         args.connection_timeout_ms,
         args.target_discovered_peers,
         args.max_concurrent_tasks,
-    )
-    .await;
+    );
+    let start = std::time::Instant::now();
+    btc_network_explorer.crawl_network().await;
     let elapsed = start.elapsed().as_secs();
-    info!("Discovered {} peers in {}secs", addresses.len(), elapsed);
+    info!(
+        "Discovered {} peers in {}secs",
+        btc_network_explorer.get_discovered_peers_num().await,
+        elapsed
+    );
 }

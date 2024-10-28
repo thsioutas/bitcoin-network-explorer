@@ -16,63 +16,85 @@ use tokio::time::{error::Elapsed, timeout};
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
-pub async fn crawl_network(
+pub struct BtcNetworkExplorer {
     initial_address: SocketAddr,
     connection_timeout: u64,
     target_discovered_peers: usize,
     max_concurrent_tasks: usize,
-) -> HashSet<SocketAddr> {
-    // Each peer should be processed more than once because the first time might not return all the available info for several reasons (timeouts etc)
-    const MAX_PROCESS_PEER_ATTEMPTS: u8 = 2;
+    discovered_peers: Arc<Mutex<HashSet<SocketAddr>>>,
+}
 
-    let discovered_peers = Arc::new(Mutex::new(HashSet::new()));
-    // This could also be a HashSet but due to the logic we have to add a peer to the discovered_peers
-    // it can safely be a Vec
-    let queued_peers = Arc::new(Mutex::new(vec![initial_address]));
-    let semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
-
-    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-    // Craw network until:
-    // 1. Target number of peers are discovered, and
-    // 2. The queued peers list is not empty or there is a task that is not finished (and can introduce more peers to be checked)
-    while discovered_peers.lock().await.len() < target_discovered_peers
-        && (!queued_peers.lock().await.is_empty()
-            || tasks.iter().any(|handle| !handle.is_finished()))
-    {
-        while let Some(peer) = queued_peers.lock().await.pop() {
-            let discovered_peers = discovered_peers.clone();
-            let queued_peers = queued_peers.clone();
-            let semaphore = semaphore.clone();
-            tasks.push(tokio::spawn(async move {
-                if let Err(err) = semaphore.acquire().await {
-                    error!("Failed to acquire semaphore = {:?}", err);
-                }
-                let mut attempts = 0;
-                // Process the same peer MAX_PROCESS_PEER_ATTEMPTS times
-                while attempts < MAX_PROCESS_PEER_ATTEMPTS {
-                    if let Err(e) = process_peer(
-                        peer,
-                        connection_timeout,
-                        target_discovered_peers,
-                        discovered_peers.clone(),
-                        queued_peers.clone(),
-                    )
-                    .await
-                    {
-                        error!("Failed to crawl peer {}: {}", peer, e);
-                    }
-                    info!("Processed peer {}. Still need to discover {} peers. {} peers in queue to be checked.", peer, target_discovered_peers - discovered_peers.lock().await.len(), queued_peers.lock().await.len());
-                    attempts += 1;
-                }
-            }))
+impl BtcNetworkExplorer {
+    pub fn new(
+        initial_address: SocketAddr,
+        connection_timeout: u64,
+        target_discovered_peers: usize,
+        max_concurrent_tasks: usize,
+    ) -> Self {
+        Self {
+            initial_address,
+            connection_timeout,
+            target_discovered_peers,
+            max_concurrent_tasks,
+            discovered_peers: Default::default(),
         }
     }
 
-    // Wait for all tasks to finish
-    futures::future::join_all(tasks).await;
+    pub async fn crawl_network(&self) {
+        // Each peer should be processed more than once because the first time might not return all the available info for several reasons (timeouts etc)
+        const MAX_PROCESS_PEER_ATTEMPTS: u8 = 2;
 
-    let discovered_peers = discovered_peers.lock().await.clone();
-    discovered_peers
+        // This could also be a HashSet but due to the logic we have to add a peer to the discovered_peers
+        // it can safely be a Vec
+        let queued_peers = Arc::new(Mutex::new(vec![self.initial_address]));
+        let semaphore = Arc::new(Semaphore::new(self.max_concurrent_tasks));
+
+        let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+        // Craw network until:
+        // 1. Target number of peers are discovered, and
+        // 2. The queued peers list is not empty or there is a task that is not finished (and can introduce more peers to be checked)
+        while self.discovered_peers.lock().await.len() < self.target_discovered_peers
+            && (!queued_peers.lock().await.is_empty()
+                || tasks.iter().any(|handle| !handle.is_finished()))
+        {
+            while let Some(peer) = queued_peers.lock().await.pop() {
+                let discovered_peers_clone = self.discovered_peers.clone();
+                let connection_timeout_clone = self.connection_timeout.clone();
+                let target_discovered_peers_clone = self.target_discovered_peers.clone();
+                let queued_peers_clone = queued_peers.clone();
+                let semaphore = semaphore.clone();
+                tasks.push(tokio::spawn(async move {
+                    if let Err(err) = semaphore.acquire().await {
+                        error!("Failed to acquire semaphore = {:?}", err);
+                    }
+                    let mut attempts = 0;
+                    // Process the same peer MAX_PROCESS_PEER_ATTEMPTS times
+                    while attempts < MAX_PROCESS_PEER_ATTEMPTS {
+                        if let Err(e) = process_peer(
+                            peer,
+                            connection_timeout_clone,
+                            target_discovered_peers_clone,
+                            discovered_peers_clone.clone(),
+                            queued_peers_clone.clone(),
+                        )
+                        .await
+                        {
+                            error!("Failed to crawl peer {}: {}", peer, e);
+                        }
+                        info!("Processed peer {}. Still need to discover {} peers. {} peers in queue to be checked.", peer, target_discovered_peers_clone - discovered_peers_clone.lock().await.len(), queued_peers_clone.lock().await.len());
+                        attempts += 1;
+                    }
+                }));
+            }
+        }
+
+        // Wait for all tasks to finish
+        futures::future::join_all(tasks).await;
+    }
+
+    pub async fn get_discovered_peers_num(&self) -> usize {
+        self.discovered_peers.lock().await.len()
+    }
 }
 
 /// Process a single peer by:
