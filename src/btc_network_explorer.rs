@@ -25,6 +25,23 @@ pub struct BtcNetworkExplorer {
 }
 
 impl BtcNetworkExplorer {
+    /// Creates a new instance of `BtcNetworkExplorer`, configured to explore the Bitcoin P2P network.
+    ///
+    /// # Parameters
+    ///
+    /// - `initial_address`: The initial `SocketAddr` of a known Bitcoin node, which serves as the starting point
+    ///   for network exploration. This address is used to establish the first connection and begin peer discovery.
+    /// - `connection_timeout`: Timeout duration in milliseconds for each peer connection attempt. If a peer
+    ///   does not respond within this time, the connection attempt will be aborted.
+    /// - `target_discovered_peers`: The target number of unique peer addresses to discover. Network exploration
+    ///   will continue until this number of peers is found, or no additional peers are available.
+    /// - `max_concurrent_tasks`: The maximum number of concurrent peer connection tasks. This value controls
+    ///   the level of concurrency, balancing exploration speed and resource usage.
+    ///
+    /// # Returns
+    ///
+    /// Returns a new `BtcNetworkExplorer` instance ready for use. Once created, use the `crawl_network` method
+    /// to begin exploring the Bitcoin network from the initial address.
     pub fn new(
         initial_address: SocketAddr,
         connection_timeout: u64,
@@ -40,6 +57,24 @@ impl BtcNetworkExplorer {
         }
     }
 
+    /// Begins crawling the Bitcoin P2P network from the initial address, continuously discovering new peer
+    /// addresses until the target number of unique peers is reached.
+    ///
+    /// This method connects to each peer address, performs the required Bitcoin P2P protocol handshake, and
+    /// requests additional peer addresses. Discovered peers are added to a shared list, and the process repeats
+    /// with each newly discovered peer until the target number of peers is collected or no further peers are available.
+    ///
+    /// The method uses a semaphore to control the maximum number of concurrent connection tasks, as defined by
+    /// `max_concurrent_tasks`, ensuring efficient resource usage. Peer discovery will retry a limited number
+    /// of times on failed connection attempts to maximize success.
+    ///
+    /// # Behavior
+    ///
+    /// - Network exploration continues until:
+    ///   - The number of unique discovered peers reaches `target_discovered_peers`, or
+    ///   - The queue of pending peers is empty and no active tasks remain.
+    /// - Each peer connection attempt has a timeout (specified by `connection_timeout`), after which it is
+    ///   considered failed.
     pub async fn crawl_network(&self) {
         // How many times each peer should be processed
         const MAX_PROCESS_PEER_ATTEMPTS: u8 = 2;
@@ -90,6 +125,15 @@ impl BtcNetworkExplorer {
         futures::future::join_all(tasks).await;
     }
 
+    /// Retrieves the current count of unique peer addresses discovered during network exploration.
+    ///
+    /// This method returns the total number of unique peers collected so far in the `crawl_network` process.
+    /// It provides an up-to-date count of discovered peers and can be useful for monitoring progress towards
+    /// the target peer count without interrupting the ongoing network crawl.
+    ///
+    /// # Returns
+    ///
+    /// Returns `usize` representing the number of unique discovered peers.
     pub async fn get_discovered_peers_num(&self) -> usize {
         self.discovered_peers.lock().await.len()
     }
