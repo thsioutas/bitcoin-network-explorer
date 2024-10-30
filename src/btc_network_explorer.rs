@@ -82,7 +82,7 @@ impl BtcNetworkExplorer {
                         )
                         .await
                         {
-                            error!("Failed to crawl peer {}: {}", peer, e);
+                            error!("Failed to process peer {}: {}", peer, e);
                         }
                         let to_be_checked = if target_discovered_peers_clone >= discovered_peers_clone.lock().await.len() {
                             target_discovered_peers_clone - discovered_peers_clone.lock().await.len()
@@ -119,7 +119,7 @@ async fn process_peer(
     let mut stream = connect(&peer, connection_timeout).await?;
     perform_handshake(&mut stream, peer).await?;
 
-    // Collect new peers from the given peer_address
+    // Collect new peers from the given peer
     let new_peers = collect_peers(&mut stream).await?;
 
     // Add new peers to the list of the unique discovered peers
