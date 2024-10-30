@@ -41,7 +41,7 @@ impl BtcNetworkExplorer {
     }
 
     pub async fn crawl_network(&self) {
-        // Each peer should be processed more than once because the first time might not return all the available info for several reasons (timeouts etc)
+        // How many times each peer should be processed
         const MAX_PROCESS_PEER_ATTEMPTS: u8 = 2;
 
         // This could also be a HashSet but due to the logic we have to add a peer to the discovered_peers
@@ -70,27 +70,17 @@ impl BtcNetworkExplorer {
                     if discovered_peers_clone.lock().await.len() >= target_discovered_peers_clone {
                         return;
                     }
-                    let mut attempts = 0;
-                    // Process the same peer MAX_PROCESS_PEER_ATTEMPTS times
-                    while attempts < MAX_PROCESS_PEER_ATTEMPTS {
-                        if let Err(e) = process_peer(
-                            peer,
-                            connection_timeout_clone,
-                            target_discovered_peers_clone,
-                            discovered_peers_clone.clone(),
-                            queued_peers_clone.clone(),
-                        )
-                        .await
-                        {
-                            error!("Failed to process peer {}: {}", peer, e);
-                        }
-                        let to_be_checked = if target_discovered_peers_clone >= discovered_peers_clone.lock().await.len() {
-                            target_discovered_peers_clone - discovered_peers_clone.lock().await.len()
-                        } else {
-                            0
-                        };
-                        info!("Processed peer {}. Still need to discover {} peers. {} peers in queue to be checked.", peer, to_be_checked, queued_peers_clone.lock().await.len());
-                        attempts += 1;
+                    if let Err(e) = process_peer_with_retry(
+                        peer,
+                        MAX_PROCESS_PEER_ATTEMPTS,
+                        discovered_peers_clone,
+                        queued_peers_clone,
+                        connection_timeout_clone,
+                        target_discovered_peers_clone,
+                    )
+                    .await
+                    {
+                        error!("Failed to process peer {} after retries: {}", peer, e);
                     }
                 }));
             }
@@ -103,6 +93,52 @@ impl BtcNetworkExplorer {
     pub async fn get_discovered_peers_num(&self) -> usize {
         self.discovered_peers.lock().await.len()
     }
+}
+
+/// Process a peer with retry logic
+async fn process_peer_with_retry(
+    peer: SocketAddr,
+    max_attempts: u8,
+    discovered_peers: Arc<Mutex<HashSet<SocketAddr>>>,
+    queued_peers: Arc<Mutex<Vec<SocketAddr>>>,
+    connection_timeout: u64,
+    target_discovered_peers: usize,
+) -> Result<(), Error> {
+    let mut attempts = 0;
+
+    while attempts < max_attempts {
+        attempts += 1;
+
+        match process_peer(
+            peer,
+            connection_timeout,
+            target_discovered_peers,
+            discovered_peers.clone(),
+            queued_peers.clone(),
+        )
+        .await
+        {
+            Ok(_) => {
+                let discovered_count = discovered_peers.lock().await.len();
+                let remaining_peers = target_discovered_peers.saturating_sub(discovered_count);
+                let queued_count = queued_peers.lock().await.len();
+                info!("Processed peer {} on attempt {}/{}. Still need to discover {} peers. {} peers in queue to be checked.", 
+                peer, attempts, max_attempts, remaining_peers, queued_count);
+                return Ok(());
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to process peer {} on attempt {}/{}: {}",
+                    peer, attempts, max_attempts, e
+                );
+                if attempts == max_attempts {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Process a single peer by:
